@@ -19,6 +19,7 @@ namespace tcp {
 struct attr {
   attr() {}
   /* implicit */ attr(const char* ptr) : hostname(ptr) {}
+  /* implicit */ attr(const char* ptr, bool secure) : hostname(ptr), secure_(secure) {}
 
   std::string hostname;
 
@@ -31,6 +32,7 @@ struct attr {
   int ai_protocol;
   struct sockaddr_storage ai_addr;
   int ai_addrlen;
+  bool secure_ = false;
 };
 
 } // namespace tcp

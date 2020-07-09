@@ -52,6 +52,7 @@ class Device : public ::gloo::transport::Device,
 
   friend class Pair;
   friend class Buffer;
+  friend class Context;
 
  private:
   std::shared_ptr<Loop> loop_;

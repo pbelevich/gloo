@@ -24,6 +24,9 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <assert.h>
+#include <poll.h>
+#include <iostream>
 
 #include "gloo/common/error.h"
 #include "gloo/common/logging.h"
@@ -60,6 +63,7 @@ Pair::Pair(
       timeout_(timeout),
       busyPoll_(false),
       fd_(FD_INVALID),
+      ssl_(nullptr),
       sendBufferSize_(0),
       ex_(nullptr) {
   listen();
@@ -99,6 +103,7 @@ const Address& Pair::address() const {
 
 void Pair::connect(const std::vector<char>& bytes) {
   auto peer = Address(bytes);
+  std::cout << this->device_->str() << " connects to " << peer.str() << std::endl;
   connect(peer);
 }
 
@@ -123,7 +128,7 @@ void Pair::setSync(bool sync, bool busyPoll) {
 
   // Wait for pair to be connected. No need to wait for timeout here. If
   // necessary, the connect path will timeout and signal this thread.
-  waitUntilConnected(lock, false);
+  waitUntil(SSL_CONNECTED, lock, false);
   if (state_ == CLOSED) {
     signalAndThrowException(
         GLOO_ERROR_MSG("Socket unexpectedly closed ", peer_.str()));
@@ -236,9 +241,13 @@ void Pair::connect(const Address& peer) {
 
   // self_ < peer_; we are listening side.
   if (rv < 0) {
-    waitUntilConnected(lock, true);
+    std::cout << this->device_->str() << " is listening" << std::endl;
+    waitUntil(SSL_CONNECTED, lock, true);
+    std::cout << this->device_->str() << " is SSL_CONNECTED" << std::endl;
     return;
   }
+
+  std::cout << this->device_->str() << " is connecting" << std::endl;
 
   // self_ > peer_; we are connecting side.
   // First destroy listening socket.
@@ -273,7 +282,51 @@ void Pair::connect(const Address& peer) {
   device_->registerDescriptor(fd_, EPOLLIN | EPOLLOUT, this);
 
   // Wait for connection to complete
-  waitUntilConnected(lock, true);
+  waitUntil(CONNECTED, lock, true);
+
+  assert(context_->ssl_ctx_ != nullptr);
+  ssl_ = SSL_new(context_->ssl_ctx_);
+  if (ssl_ == NULL) {
+    ERR_print_errors_fp(stderr);
+    GLOO_ENFORCE(0, "SSL_new failed");
+  }
+
+  if (!SSL_set_fd (ssl_, fd_)) {
+    ERR_print_errors_fp (stderr);
+    GLOO_ENFORCE(0, "SSL_set_fd failed");
+  }
+
+  SSL_set_connect_state(ssl_);
+
+  int r = 0;
+  int events = POLLIN | POLLOUT | POLLERR;
+  while ((r = SSL_do_handshake(ssl_)) != 1) {
+    int err = SSL_get_error(ssl_, r);
+    if (err == SSL_ERROR_WANT_WRITE) {
+      events |= POLLOUT;
+      events &= ~POLLIN;
+//      log("return want write set events %d\n", events);
+    } else if (err == SSL_ERROR_WANT_READ) {
+      events |= EPOLLIN;
+      events &= ~EPOLLOUT;
+//      log("return want read set events %d\n", events);
+    } else {
+//      log("SSL_do_handshake return %d error %d errno %d msg %s\n", r, err, errno, strerror(errno));
+      ERR_print_errors_fp(stderr);
+      GLOO_ENFORCE(0, "do handshake error");
+    }
+    struct pollfd pfd;
+    pfd.fd = fd_;
+    pfd.events = events;
+    do {
+      r = poll(&pfd, 1, 100);
+    } while  (r == 0);
+    GLOO_ENFORCE(r == 1, "poll return %d error events: %d errno %d %s\n", r, pfd.revents, errno, strerror(errno));
+  }
+//  log("ssl connected \n");
+
+  // Wait for connection to complete
+  waitUntil(SSL_CONNECTED, lock, true);
 }
 
 ssize_t Pair::prepareWrite(
@@ -356,8 +409,29 @@ bool Pair::write(Op& op) {
     const auto nbytes = prepareWrite(op, buf, iov.data(), ioc);
 
     // Write
-    rv = writev(fd_, iov.data(), ioc);
-    if (rv == -1) {
+    std::cout << "write " << ioc << " bytes" << std::endl;
+    rv = SSL_write(ssl_, iov.data(), ioc);
+    if (rv <= 0) {
+      int err = SSL_get_error(ssl_, rv);
+      const char* err_str = nullptr;
+      switch (err) {
+        case SSL_ERROR_NONE: err_str = "SSL_ERROR_NONE"; break;
+        case SSL_ERROR_SSL: err_str = "SSL_ERROR_SSL"; break;
+        case SSL_ERROR_WANT_READ: err_str = "SSL_ERROR_WANT_READ"; break;
+        case SSL_ERROR_WANT_WRITE: err_str = "SSL_ERROR_WANT_WRITE"; break;
+        case SSL_ERROR_WANT_X509_LOOKUP: err_str = "SSL_ERROR_WANT_X509_LOOKUP"; break;
+        case SSL_ERROR_SYSCALL: err_str = "SSL_ERROR_SYSCALL"; break;
+        case SSL_ERROR_ZERO_RETURN: err_str = "SSL_ERROR_ZERO_RETURN"; break;
+        case SSL_ERROR_WANT_CONNECT: err_str = "SSL_ERROR_WANT_CONNECT"; break;
+        case SSL_ERROR_WANT_ACCEPT: err_str = "SSL_ERROR_WANT_ACCEPT"; break;
+        case SSL_ERROR_WANT_ASYNC: err_str = "SSL_ERROR_WANT_ASYNC"; break;
+        case SSL_ERROR_WANT_ASYNC_JOB: err_str = "SSL_ERROR_WANT_ASYNC_JOB"; break;
+        case SSL_ERROR_WANT_CLIENT_HELLO_CB: err_str = "SSL_ERROR_WANT_CLIENT_HELLO_CB"; break;
+        default: err_str = ""; break;
+      }
+      std::cout << "write err = " << err_str << "(" << err << ")" << std::endl;
+      std::cout << "write errno = " << strerror(errno) << "(" << errno << ")" << std::endl;
+
       if (errno == EAGAIN) {
         if (sync_) {
           // Sync mode: blocking call returning with EAGAIN indicates timeout.
@@ -373,9 +447,28 @@ bool Pair::write(Op& op) {
         continue;
       }
 
+      if (!sync_) {
+        if (err == SSL_ERROR_SYSCALL) {
+          if (errno == 0) {
+            // Success
+            return false;
+          }
+          if (errno == EPIPE) {
+            // Broken pipe
+            return false;
+          }
+          if (errno == ECONNRESET) {
+            // Connection reset by peer
+            return false;
+          }
+        } else if (err == SSL_ERROR_ZERO_RETURN) {
+          return false;
+        }
+      }
+
       // Unexpected error
       signalException(
-          GLOO_ERROR_MSG("writev ", peer_.str(), ": ", strerror(errno)));
+          GLOO_ERROR_MSG("Write error ", peer_.str(), ": ", err_str, ", errno = ", strerror(errno)));
       return false;
     }
 
@@ -530,8 +623,29 @@ bool Pair::read() {
     ssize_t rv = 0;
     for (;;) {
       // Alas, readv does not support flags, so we need to use recv
-      rv = ::recv(fd_, iov.iov_base, iov.iov_len, busyPoll_ ? MSG_DONTWAIT : 0);
-      if (rv == -1) {
+      std::cout << "read " << iov.iov_len << " bytes" << std::endl;
+      rv = SSL_read(ssl_, iov.iov_base, iov.iov_len);
+      if (rv <= 0) {
+        int err = SSL_get_error(ssl_, rv);
+        const char* err_str = nullptr;
+        switch (err) {
+          case SSL_ERROR_NONE: err_str = "SSL_ERROR_NONE"; break;
+          case SSL_ERROR_SSL: err_str = "SSL_ERROR_SSL"; break;
+          case SSL_ERROR_WANT_READ: err_str = "SSL_ERROR_WANT_READ"; break;
+          case SSL_ERROR_WANT_WRITE: err_str = "SSL_ERROR_WANT_WRITE"; break;
+          case SSL_ERROR_WANT_X509_LOOKUP: err_str = "SSL_ERROR_WANT_X509_LOOKUP"; break;
+          case SSL_ERROR_SYSCALL: err_str = "SSL_ERROR_SYSCALL"; break;
+          case SSL_ERROR_ZERO_RETURN: err_str = "SSL_ERROR_ZERO_RETURN"; break;
+          case SSL_ERROR_WANT_CONNECT: err_str = "SSL_ERROR_WANT_CONNECT"; break;
+          case SSL_ERROR_WANT_ACCEPT: err_str = "SSL_ERROR_WANT_ACCEPT"; break;
+          case SSL_ERROR_WANT_ASYNC: err_str = "SSL_ERROR_WANT_ASYNC"; break;
+          case SSL_ERROR_WANT_ASYNC_JOB: err_str = "SSL_ERROR_WANT_ASYNC_JOB"; break;
+          case SSL_ERROR_WANT_CLIENT_HELLO_CB: err_str = "SSL_ERROR_WANT_CLIENT_HELLO_CB"; break;
+          default: err_str = "";
+        }
+        std::cout << "read err = " << err_str << "(" << err << ")" << std::endl;
+        std::cout << "read errno = " << strerror(errno) << "(" << errno << ")" << std::endl;
+
         // EAGAIN happens when (1) non-blocking and there are no more bytes left
         // to read or (2) blocking and timeout occurs.
         if (errno == EAGAIN) {
@@ -561,9 +675,28 @@ bool Pair::read() {
           continue;
         }
 
+        if (!sync_) {
+          if (err == SSL_ERROR_SYSCALL) {
+            if (errno == 0) {
+              // Success
+              return false;
+            }
+            if (errno == EPIPE) {
+              // Broken pipe
+              return false;
+            }
+            if (errno == ECONNRESET) {
+              // Connection reset by peer
+              return false;
+            }
+          } else if (err == SSL_ERROR_ZERO_RETURN) {
+            return false;
+          }
+        }
+
         // Unexpected error
         signalException(
-            GLOO_ERROR_MSG("Read error ", peer_.str(), ": ", strerror(errno)));
+            GLOO_ERROR_MSG("Read error ", peer_.str(), ": ", err_str, ", errno = ", strerror(errno)));
         return false;
       }
       break;
@@ -603,6 +736,60 @@ bool Pair::read() {
   // Reset read operation state.
   rx_ = Op();
   return true;
+}
+
+void Pair::handshake() {
+  if (state_ < CONNECTED) { // if not tcp connected
+    struct pollfd pfd;
+    pfd.fd = fd_;
+    pfd.events = POLLOUT | POLLERR;
+    int r = poll(&pfd, 1, 0);
+    if (r == 1 && pfd.revents == POLLOUT) {
+//      log("tcp connected fd %d\n", fd_);
+      changeState(CONNECTED);
+      int events = EPOLLIN | EPOLLOUT | EPOLLERR;
+      device_->registerDescriptor(fd_, events, this);
+    } else {
+//      log("poll fd %d return %d revents %d\n", fd_, r, pfd.revents);
+//      delete ch;
+      return;
+    }
+  }
+  if (ssl_ == nullptr) {
+    assert(context_->ssl_ctx_ != nullptr);
+    ssl_ = SSL_new(context_->ssl_ctx_);
+    GLOO_ENFORCE(ssl_ != nullptr, "SSL_new failed");
+    int r = SSL_set_fd(ssl_, fd_);
+    GLOO_ENFORCE(r, "SSL_set_fd failed");
+//    log("SSL_set_accept_state for fd %d\n", fd_);
+    SSL_set_accept_state(ssl_);
+  }
+  int r = SSL_do_handshake(ssl_);
+  if (r == 1) {
+    changeState(SSL_CONNECTED);
+//    log("ssl connected fd %d\n", fd_);
+    return;
+  }
+  int err = SSL_get_error(ssl_, r);
+  int events = 0;
+  int oldev = events;
+  if (err == SSL_ERROR_WANT_WRITE) {
+    events |= EPOLLOUT;
+    events &= ~EPOLLIN;
+//    log("return want write set events %d\n", events);
+    if (oldev == events) return;
+    device_->registerDescriptor(fd_, events, this);
+  } else if (err == SSL_ERROR_WANT_READ) {
+    events |= EPOLLIN;
+    events &= ~EPOLLOUT;
+//    log("return want read set events %d\n", events);
+    if (oldev == events) return;
+    device_->registerDescriptor(fd_, events, this);
+  } else {
+//    log("SSL_do_handshake return %d error %d errno %d msg %s\n", r, err, errno, strerror(errno));
+//    ERR_print_errors(errBio);
+//    delete ch;
+  }
 }
 
 // This function is called upon receiving a message from the peer
@@ -683,17 +870,21 @@ void Pair::handleEvents(int events) {
     return;
   }
 
-  // State must be <= CONNECTED.
+  // State must be <= SSL_CONNECTED.
   // If state is CLOSED; this function will NOT be called. Refer to
   // Pair::changeState and Device::unregisterDescriptor for more info.
-  GLOO_ENFORCE_LE(state_, CONNECTED);
+  GLOO_ENFORCE_LE(state_, SSL_CONNECTED);
 
   // Exception must not be set.
   // If exception is set, state must advance to CLOSED state.
   GLOO_ENFORCE(ex_ == nullptr);
 
   if (state_ == CONNECTED) {
-    if (state_ == CONNECTED && (events & EPOLLOUT)) {
+    return handshake();
+  }
+
+  if (state_ == SSL_CONNECTED) {
+    if (events & EPOLLOUT) {
       GLOO_ENFORCE(
           !tx_.empty(), "tx_ cannot be empty because EPOLLOUT happened");
       while (!tx_.empty()) {
@@ -710,7 +901,7 @@ void Pair::handleEvents(int events) {
         device_->registerDescriptor(fd_, EPOLLIN, this);
       }
     }
-    if (state_ == CONNECTED && (events & EPOLLIN)) {
+    if (events & EPOLLIN) {
       while (read()) {
         // Keep going
       }
@@ -736,7 +927,7 @@ void Pair::handleListening() {
   socklen_t addrlen = sizeof(addr);
   int rv;
 
-  rv = accept(fd_, (struct sockaddr*)&addr, &addrlen);
+  rv = accept4(fd_, (struct sockaddr*)&addr, &addrlen, SOCK_CLOEXEC);
 
   // Close the listening file descriptor whether we've successfully connected
   // or run into an error and will throw an exception.
@@ -798,7 +989,7 @@ void Pair::handleConnected() {
   rv = setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
   GLOO_ENFORCE_NE(rv, -1);
 
-  device_->registerDescriptor(fd_, EPOLLIN, this);
+  device_->registerDescriptor(fd_, EPOLLIN | EPOLLOUT, this);
   changeState(CONNECTED);
 }
 
@@ -872,6 +1063,15 @@ void Pair::changeState(state nextState) noexcept {
         ::close(fd_);
         fd_ = FD_INVALID;
         break;
+      case SSL_CONNECTED:
+        SSL_shutdown(ssl_);
+        SSL_free(ssl_);
+        if (!sync_) {
+          device_->unregisterDescriptor(fd_);
+        }
+        ::close(fd_);
+        fd_ = FD_INVALID;
+        break;
       case CLOSED:
         // This can't happen, because we ignore no-op state changes above.
         // We handle it regardless to have a case for every enum value.
@@ -883,12 +1083,12 @@ void Pair::changeState(state nextState) noexcept {
   cv_.notify_all();
 }
 
-void Pair::waitUntilConnected(
+void Pair::waitUntil(state s,
     std::unique_lock<std::mutex>& lock,
     bool useTimeout) {
   auto pred = [&] {
     throwIfException();
-    return state_ >= CONNECTED;
+    return state_ >= s;
   };
   auto timeoutSet = timeout_ != kNoTimeout;
   if (useTimeout && timeoutSet) {
@@ -1161,6 +1361,7 @@ std::exception_ptr Pair::signalExceptionExternal(const std::string& msg) {
 }
 
 void Pair::signalException(const std::string& msg) {
+  std::cout << "signalException: " << msg << std::endl;
   signalException(std::make_exception_ptr(::gloo::IoException(msg)));
 }
 
@@ -1211,6 +1412,7 @@ void Pair::signalException(std::exception_ptr ex) {
 }
 
 void Pair::signalAndThrowException(const std::string& msg) {
+  std::cout << "signalAndThrowException: " << msg << std::endl;
   signalAndThrowException(std::make_exception_ptr(::gloo::IoException(msg)));
 }
 

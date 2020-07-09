@@ -21,7 +21,7 @@ namespace transport {
 namespace tcp {
 
 Loop::Loop() {
-  fd_ = epoll_create(1);
+  fd_ = epoll_create1(EPOLL_CLOEXEC);
   GLOO_ENFORCE_NE(fd_, -1, "epoll_create: ", strerror(errno));
   loop_.reset(new std::thread(&Loop::run, this));
 }

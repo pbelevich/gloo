@@ -75,7 +75,7 @@ class MultiProcWorker {
       int rank,
       std::function<void(std::shared_ptr<Context>)> fn) {
     auto context = std::make_shared<::gloo::rendezvous::Context>(rank, size);
-    auto device = ::gloo::transport::tcp::CreateDevice("localhost");
+    auto device = ::gloo::transport::tcp::CreateDevice({"localhost", true});
     context->setTimeout(std::chrono::milliseconds(kMultiProcTimeout));
     context->connectFullMesh(*store_, device);
     device.reset();

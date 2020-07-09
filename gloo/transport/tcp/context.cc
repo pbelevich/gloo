@@ -19,7 +19,23 @@ namespace transport {
 namespace tcp {
 
 Context::Context(std::shared_ptr<Device> device, int rank, int size)
-    : ::gloo::transport::Context(rank, size), device_(std::move(device)) {}
+    : ::gloo::transport::Context(rank, size), device_(std::move(device)) {
+  std::call_once(ssl_ctx_init_, []() {
+    SSL_load_error_strings();
+    int r = SSL_library_init();
+    GLOO_ENFORCE(r, "SSL_library_init failed");
+  });
+  ssl_ctx_ = SSL_CTX_new (SSLv23_method());
+  GLOO_ENFORCE(ssl_ctx_ != nullptr, "SSL_CTX_new failed");
+//  errBio = BIO_new_fd(2, BIO_NOCLOSE);
+  auto cert = "/gloo/certificate.pem", key = "/gloo/key.pem";
+  int r = SSL_CTX_use_certificate_file(ssl_ctx_, cert, SSL_FILETYPE_PEM);
+  GLOO_ENFORCE(r > 0, "SSL_CTX_use_certificate_file %s failed", cert);
+  r = SSL_CTX_use_PrivateKey_file(ssl_ctx_, key, SSL_FILETYPE_PEM);
+  GLOO_ENFORCE(r > 0, "SSL_CTX_use_PrivateKey_file %s failed", key);
+  r = SSL_CTX_check_private_key(ssl_ctx_);
+  GLOO_ENFORCE(r, "SSL_CTX_check_private_key failed");
+}
 
 Context::~Context() {
   // Pairs refer to device by raw pointer.

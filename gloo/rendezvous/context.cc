@@ -10,6 +10,7 @@
 
 #include "gloo/common/logging.h"
 #include "gloo/transport/address.h"
+#include <iostream>
 
 namespace gloo {
 namespace rendezvous {

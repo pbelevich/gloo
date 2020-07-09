@@ -25,6 +25,9 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
 #include "gloo/common/memory.h"
 #include "gloo/transport/pair.h"
 #include "gloo/transport/tcp/address.h"
@@ -81,7 +84,8 @@ class Pair : public ::gloo::transport::Pair, public Handler {
     LISTENING = 2,
     CONNECTING = 3,
     CONNECTED = 4,
-    CLOSED = 5,
+    SSL_CONNECTED = 5,
+    CLOSED = 6,
   };
 
  public:
@@ -161,6 +165,7 @@ class Pair : public ::gloo::transport::Pair, public Handler {
   // Can only be used with sync receive mode.
   bool busyPoll_;
   int fd_;
+  SSL* ssl_;
   size_t sendBufferSize_;
 
   Address self_;
@@ -253,6 +258,8 @@ class Pair : public ::gloo::transport::Pair, public Handler {
   //
   bool read();
 
+  void handshake();
+
   // Helper function that is called from the `read` function.
   void handleRemotePendingSend(const Op& op);
 
@@ -291,7 +298,7 @@ class Pair : public ::gloo::transport::Pair, public Handler {
 
   // Helper function to block execution until the pair has advanced to
   // the `CONNECTED` state. Expected to be called from `Pair::connect`.
-  void waitUntilConnected(std::unique_lock<std::mutex>& lock, bool useTimeout);
+  void waitUntil(state s, std::unique_lock<std::mutex>& lock, bool useTimeout);
 
   // Helper function to assert the current state is `CONNECTED`.
   void verifyConnected();
