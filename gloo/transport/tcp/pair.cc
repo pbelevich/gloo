@@ -24,6 +24,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <iostream>
 
 #include "gloo/common/error.h"
 #include "gloo/common/logging.h"
@@ -60,19 +61,24 @@ Pair::Pair(
       timeout_(timeout),
       busyPoll_(false),
       fd_(FD_INVALID),
+      ssl_(nullptr),
       sendBufferSize_(0),
       ex_(nullptr) {
+  std::cout << "[" << getpid() << "]" << " c-tor started" << std::endl;
   listen();
+  std::cout << "[" << getpid() << "]" << " c-tor finished" << std::endl;
 }
 
 // Destructor performs a "soft" close.
 Pair::~Pair() {
+  std::cout << "[" << getpid() << "]" << " d-tor started" << std::endl;
   // Needs lock so that this doesn't race with read/write of the
   // underlying file descriptor on the device thread.
   std::lock_guard<std::mutex> lock(m_);
   if (state_ != CLOSED) {
     changeState(CLOSED);
   }
+  std::cout << "[" << getpid() << "]" << " d-tor finished" << std::endl;
 }
 
 // The close function performs a "hard" close.
@@ -82,6 +88,7 @@ void Pair::close() {
   // Needs lock so that this doesn't race with read/write of the
   // underlying file descriptor on the device thread.
   std::lock_guard<std::mutex> lock(m_);
+  std::cout << "[" << getpid() << "]" << " close started" << std::endl;
   if (state_ != CLOSED) {
     if (fd_ != FD_INVALID) {
       struct linger sl;
@@ -91,6 +98,7 @@ void Pair::close() {
     }
     changeState(CLOSED);
   }
+  std::cout << "[" << getpid() << "]" << " close finished" << std::endl;
 }
 
 const Address& Pair::address() const {
@@ -112,6 +120,7 @@ static void setSocketBlocking(int fd, bool enable) {
   }
   rv = fcntl(fd, F_SETFL, rv);
   GLOO_ENFORCE_NE(rv, -1);
+  std::cout << "[" << getpid() << "]" << " setSocketBlocking(" << enable << ")" << std::endl;
 }
 
 void Pair::setSync(bool sync, bool busyPoll) {
@@ -123,7 +132,7 @@ void Pair::setSync(bool sync, bool busyPoll) {
 
   // Wait for pair to be connected. No need to wait for timeout here. If
   // necessary, the connect path will timeout and signal this thread.
-  waitUntilConnected(lock, false);
+  waitUntil(CONNECTED, lock, false);
   if (state_ == CLOSED) {
     signalAndThrowException(
         GLOO_ERROR_MSG("Socket unexpectedly closed ", peer_.str()));
@@ -153,6 +162,7 @@ void Pair::setSync(bool sync, bool busyPoll) {
 
 void Pair::listen() {
   std::lock_guard<std::mutex> lock(m_);
+  std::cout << "[" << getpid() << "]" << " listen start" << std::endl;
   int rv;
 
   const auto& attr = device_->attr_;
@@ -190,12 +200,13 @@ void Pair::listen() {
   // Register with device so we're called when peer connects
   changeState(LISTENING);
   device_->registerDescriptor(fd_, EPOLLIN, this);
-
+  std::cout << "[" << getpid() << "]" << " listen finished" << std::endl;
   return;
 }
 
 void Pair::connect(const Address& peer) {
   std::unique_lock<std::mutex> lock(m_);
+  std::cout << "[" << getpid() << "]" << " connect start" << std::endl;
   int rv;
   socklen_t addrlen;
   throwIfException();
@@ -236,7 +247,8 @@ void Pair::connect(const Address& peer) {
 
   // self_ < peer_; we are listening side.
   if (rv < 0) {
-    waitUntilConnected(lock, true);
+    waitUntil(CONNECTED, lock, true);
+    std::cout << "[" << getpid() << "]" << " connect finished (listening and now connected)" << std::endl;
     return;
   }
 
@@ -273,7 +285,8 @@ void Pair::connect(const Address& peer) {
   device_->registerDescriptor(fd_, EPOLLIN | EPOLLOUT, this);
 
   // Wait for connection to complete
-  waitUntilConnected(lock, true);
+  waitUntil(CONNECTED, lock, true);
+  std::cout << "[" << getpid() << "]" << " connect finished (connecting and now connected)" << std::endl;
 }
 
 ssize_t Pair::prepareWrite(
@@ -356,8 +369,10 @@ bool Pair::write(Op& op) {
     const auto nbytes = prepareWrite(op, buf, iov.data(), ioc);
 
     // Write
+    std::cout << "[" << getpid() << "]" << " write try " << ioc << " bytes" << std::endl;
     rv = writev(fd_, iov.data(), ioc);
     if (rv == -1) {
+      std::cout << "[" << getpid() << "]" << " write error " << errno << std::endl;
       if (errno == EAGAIN) {
         if (sync_) {
           // Sync mode: blocking call returning with EAGAIN indicates timeout.
@@ -378,6 +393,7 @@ bool Pair::write(Op& op) {
           GLOO_ERROR_MSG("writev ", peer_.str(), ": ", strerror(errno)));
       return false;
     }
+    std::cout << "[" << getpid() << "]" << " write success " << rv << " bytes" << std::endl;
 
     // From write(2) man page (NOTES section):
     //
@@ -530,8 +546,10 @@ bool Pair::read() {
     ssize_t rv = 0;
     for (;;) {
       // Alas, readv does not support flags, so we need to use recv
+      std::cout << "[" << getpid() << "]" << " read try " << iov.iov_len << " bytes" << std::endl;
       rv = ::recv(fd_, iov.iov_base, iov.iov_len, busyPoll_ ? MSG_DONTWAIT : 0);
       if (rv == -1) {
+        std::cout << "[" << getpid() << "]" << " read error " << errno << std::endl;
         // EAGAIN happens when (1) non-blocking and there are no more bytes left
         // to read or (2) blocking and timeout occurs.
         if (errno == EAGAIN) {
@@ -566,6 +584,7 @@ bool Pair::read() {
             GLOO_ERROR_MSG("Read error ", peer_.str(), ": ", strerror(errno)));
         return false;
       }
+      std::cout << "[" << getpid() << "]" << " read success " << rv << " bytes" << std::endl;
       break;
     }
 
@@ -680,8 +699,10 @@ void Pair::handleEvents(int events) {
   // be acquired.
   std::unique_lock<std::mutex> lock(m_, std::try_to_lock);
   if (!lock) {
+//    std::cout << "[" << getpid() << "]" << " handleEvents !lock" << std::endl;
     return;
   }
+//  std::cout << "[" << getpid() << "]" << " handleEvents start " << events << std::endl;
 
   // State must be <= CONNECTED.
   // If state is CLOSED; this function will NOT be called. Refer to
@@ -732,6 +753,7 @@ void Pair::handleEvents(int events) {
 }
 
 void Pair::handleListening() {
+  std::cout << "[" << getpid() << "]" << " handleListening started" << std::endl;
   struct sockaddr_storage addr;
   socklen_t addrlen = sizeof(addr);
   int rv;
@@ -754,9 +776,11 @@ void Pair::handleListening() {
 
   // Common connection-made code
   handleConnected();
+  std::cout << "[" << getpid() << "]" << " handleListening finished" << std::endl;
 }
 
 void Pair::handleConnecting() {
+  std::cout << "[" << getpid() << "]" << " handleConnecting started" << std::endl;
   int optval;
   socklen_t optlen = sizeof(optval);
   int rv;
@@ -772,9 +796,11 @@ void Pair::handleConnecting() {
 
   // Common connection-made code
   handleConnected();
+  std::cout << "[" << getpid() << "]" << " handleConnecting finished" << std::endl;
 }
 
 void Pair::handleConnected() {
+  std::cout << "[" << getpid() << "]" << " handleConnected started" << std::endl;
   int rv;
 
   // Reset addresses
@@ -800,6 +826,7 @@ void Pair::handleConnected() {
 
   device_->registerDescriptor(fd_, EPOLLIN, this);
   changeState(CONNECTED);
+  std::cout << "[" << getpid() << "]" << " handleConnected finished" << std::endl;
 }
 
 // getBuffer must only be called when holding lock.
@@ -879,16 +906,18 @@ void Pair::changeState(state nextState) noexcept {
     }
   }
 
+  std::cout << "[" << getpid() << "]" << " changed state from "
+            << state_ << " to " << nextState << std::endl;
   state_ = nextState;
   cv_.notify_all();
 }
 
-void Pair::waitUntilConnected(
+void Pair::waitUntil(state s,
     std::unique_lock<std::mutex>& lock,
     bool useTimeout) {
   auto pred = [&] {
     throwIfException();
-    return state_ >= CONNECTED;
+    return state_ >= s;
   };
   auto timeoutSet = timeout_ != kNoTimeout;
   if (useTimeout && timeoutSet) {
@@ -1161,6 +1190,7 @@ std::exception_ptr Pair::signalExceptionExternal(const std::string& msg) {
 }
 
 void Pair::signalException(const std::string& msg) {
+  std::cout << "[" << getpid() << "]" << " signalException: " << msg << std::endl;
   signalException(std::make_exception_ptr(::gloo::IoException(msg)));
 }
 
@@ -1211,6 +1241,7 @@ void Pair::signalException(std::exception_ptr ex) {
 }
 
 void Pair::signalAndThrowException(const std::string& msg) {
+  std::cout << "[" << getpid() << "]" << " signalAndThrowException: " << msg << std::endl;
   signalAndThrowException(std::make_exception_ptr(::gloo::IoException(msg)));
 }
 

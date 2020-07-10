@@ -139,6 +139,9 @@ endif()
 if(USE_LIBUV)
   target_link_libraries(gloo PRIVATE uv_a)
 endif()
+if(USE_OPENSSL)
+  target_link_libraries(gloo PRIVATE ssl crypto)
+endif()
 
 target_link_libraries(gloo PRIVATE ${gloo_DEPENDENCY_LIBS})
 

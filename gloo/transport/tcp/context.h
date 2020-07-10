@@ -15,6 +15,9 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
 #include "gloo/common/memory.h"
 #include "gloo/transport/context.h"
 
@@ -43,6 +46,8 @@ class Context final : public ::gloo::transport::Context,
 
  private:
   std::shared_ptr<Device> device_;
+  SSL_CTX* ssl_ctx_;
+  std::once_flag ssl_ctx_init_;
 
   using pendingRecvTuple = std::tuple<
       WeakNonOwningPtr<UnboundBuffer>,
