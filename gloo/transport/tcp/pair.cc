@@ -25,6 +25,9 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <iostream>
+#include <assert.h>
+#include <poll.h>
+#include <iostream>
 
 #include "gloo/common/error.h"
 #include "gloo/common/logging.h"
@@ -62,6 +65,7 @@ Pair::Pair(
       busyPoll_(false),
       fd_(FD_INVALID),
       ssl_(nullptr),
+      is_client_(false),
       sendBufferSize_(0),
       ex_(nullptr) {
   std::cout << "[" << getpid() << "]" << " c-tor started" << std::endl;
@@ -132,7 +136,7 @@ void Pair::setSync(bool sync, bool busyPoll) {
 
   // Wait for pair to be connected. No need to wait for timeout here. If
   // necessary, the connect path will timeout and signal this thread.
-  waitUntil(CONNECTED, lock, false);
+  waitUntil(SSL_CONNECTED, lock, false);
   if (state_ == CLOSED) {
     signalAndThrowException(
         GLOO_ERROR_MSG("Socket unexpectedly closed ", peer_.str()));
@@ -158,6 +162,42 @@ void Pair::setSync(bool sync, bool busyPoll) {
 
   sync_ = true;
   busyPoll_ = busyPoll;
+}
+
+int Pair::handshake() {
+  GLOO_ENFORCE(state_ == CONNECTED);
+
+  if (ssl_ == nullptr) {
+    assert(context_->ssl_ctx_ != nullptr);
+    ssl_ = SSL_new(context_->ssl_ctx_);
+    GLOO_ENFORCE(ssl_ != nullptr, "SSL_new failed");
+    int r = SSL_set_fd(ssl_, fd_);
+    GLOO_ENFORCE(r, "SSL_set_fd failed");
+    if (is_client_) {
+      SSL_set_connect_state(ssl_);
+      std::cout << "[" << getpid() << "]" << " handshake SSL_set_connect_state" << std::endl;
+    } else {
+      SSL_set_accept_state(ssl_);
+      std::cout << "[" << getpid() << "]" << " handshake SSL_set_accept_state" << std::endl;
+    }
+  }
+
+  int r = SSL_do_handshake(ssl_);
+  if (r == 1) {
+    changeState(SSL_CONNECTED);
+    return 0;
+  }
+  int err = SSL_get_error(ssl_, r);
+  int events = 0;
+  if (err == SSL_ERROR_WANT_WRITE) {
+    events = POLLOUT | POLLERR;
+  } else if (err == SSL_ERROR_WANT_READ) {
+    events = POLLIN | POLLERR;
+  } else {
+    ERR_print_errors_fp(stderr);
+    GLOO_ENFORCE(0, "do handshake error");
+  }
+  return events;
 }
 
 void Pair::listen() {
@@ -245,9 +285,11 @@ void Pair::connect(const Address& peer) {
     GLOO_THROW_INVALID_OPERATION_EXCEPTION("cannot connect to self");
   }
 
+  is_client_ = rv >= 0;
+
   // self_ < peer_; we are listening side.
-  if (rv < 0) {
-    waitUntil(CONNECTED, lock, true);
+  if (!is_client_) {
+    waitUntil(SSL_CONNECTED, lock, true);
     std::cout << "[" << getpid() << "]" << " connect finished (listening and now connected)" << std::endl;
     return;
   }
@@ -286,6 +328,21 @@ void Pair::connect(const Address& peer) {
 
   // Wait for connection to complete
   waitUntil(CONNECTED, lock, true);
+
+  int events;
+  while ((events = handshake())) {
+    int r;
+    struct pollfd pfd;
+    pfd.fd = fd_;
+    pfd.events = events;
+    do {
+      r = poll(&pfd, 1, 100);
+    } while  (r == 0);
+    GLOO_ENFORCE(r == 1, "poll return %d error events: %d errno %d %s\n", r, pfd.revents, errno, strerror(errno));
+  }
+  assert(state_ == SSL_CONNECTED);
+
+  waitUntil(SSL_CONNECTED, lock, true);
   std::cout << "[" << getpid() << "]" << " connect finished (connecting and now connected)" << std::endl;
 }
 
@@ -704,17 +761,27 @@ void Pair::handleEvents(int events) {
   }
 //  std::cout << "[" << getpid() << "]" << " handleEvents start " << events << std::endl;
 
-  // State must be <= CONNECTED.
+  // State must be <= SSL_CONNECTED.
   // If state is CLOSED; this function will NOT be called. Refer to
   // Pair::changeState and Device::unregisterDescriptor for more info.
-  GLOO_ENFORCE_LE(state_, CONNECTED);
+  GLOO_ENFORCE_LE(state_, SSL_CONNECTED);
 
   // Exception must not be set.
   // If exception is set, state must advance to CLOSED state.
   GLOO_ENFORCE(ex_ == nullptr);
 
   if (state_ == CONNECTED) {
-    if (state_ == CONNECTED && (events & EPOLLOUT)) {
+    if (!is_client_) {
+      int events = 0;
+      if ((events = handshake())) {
+        device_->registerDescriptor(fd_, events, this);
+      }
+    }
+    return;
+  }
+
+  if (state_ == SSL_CONNECTED) {
+    if (state_ == SSL_CONNECTED && (events & EPOLLOUT)) {
       GLOO_ENFORCE(
           !tx_.empty(), "tx_ cannot be empty because EPOLLOUT happened");
       while (!tx_.empty()) {
@@ -731,7 +798,7 @@ void Pair::handleEvents(int events) {
         device_->registerDescriptor(fd_, EPOLLIN, this);
       }
     }
-    if (state_ == CONNECTED && (events & EPOLLIN)) {
+    if (state_ == SSL_CONNECTED && (events & EPOLLIN)) {
       while (read()) {
         // Keep going
       }
@@ -899,6 +966,13 @@ void Pair::changeState(state nextState) noexcept {
         ::close(fd_);
         fd_ = FD_INVALID;
         break;
+      case SSL_CONNECTED:
+        if (!sync_) {
+          device_->unregisterDescriptor(fd_);
+        }
+        ::close(fd_);
+        fd_ = FD_INVALID;
+        break;
       case CLOSED:
         // This can't happen, because we ignore no-op state changes above.
         // We handle it regardless to have a case for every enum value.
@@ -931,11 +1005,11 @@ void Pair::waitUntil(state s,
   }
 }
 
-void Pair::verifyConnected() {
+void Pair::verifySSLConnected() {
   // This code path should only be called after reaching the connected state
   GLOO_ENFORCE_GE(
       state_,
-      CONNECTED,
+      SSL_CONNECTED,
       "Pair is not connected (",
       self_.str(),
       " <--> ",
@@ -990,7 +1064,7 @@ void Pair::sendAsyncMode(Op& op) {
 void Pair::send(Op& op) {
   std::unique_lock<std::mutex> lock(m_);
   throwIfException();
-  verifyConnected();
+  verifySSLConnected();
 
   // Try to size the send buffer such that the write below completes
   // synchronously and we don't need to finish the write later.
@@ -1017,7 +1091,7 @@ void Pair::send(Op& op) {
 void Pair::recv() {
   std::unique_lock<std::mutex> lock(m_);
   throwIfException();
-  verifyConnected();
+  verifySSLConnected();
 
   auto rv = read();
   if (!rv) {

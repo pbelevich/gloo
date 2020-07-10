@@ -170,6 +170,7 @@ class Pair : public ::gloo::transport::Pair, public Handler {
 
   Address self_;
   Address peer_;
+  bool is_client_;
 
   std::mutex m_;
   std::condition_variable cv_;
@@ -192,6 +193,8 @@ class Pair : public ::gloo::transport::Pair, public Handler {
 
   void listen();
   void connect(const Address& peer);
+
+  int handshake();
 
   Buffer* getBuffer(int slot);
   void registerBuffer(Buffer* buf);
@@ -299,7 +302,7 @@ class Pair : public ::gloo::transport::Pair, public Handler {
   void waitUntil(state s, std::unique_lock<std::mutex>& lock, bool useTimeout);
 
   // Helper function to assert the current state is `CONNECTED`.
-  void verifyConnected();
+  void verifySSLConnected();
 
   // Throws if an exception if set.
   void throwIfException();
