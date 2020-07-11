@@ -427,27 +427,50 @@ bool Pair::write(Op& op) {
 
     // Write
     std::cout << "[" << getpid() << "]" << " write try " << ioc << " bytes" << std::endl;
-    rv = writev(fd_, iov.data(), ioc);
-    if (rv == -1) {
+    rv = SSL_write(ssl_, iov.data(), ioc);
+    if (rv <= 0) {
       std::cout << "[" << getpid() << "]" << " write error " << errno << std::endl;
-      if (errno == EAGAIN) {
-        if (sync_) {
-          // Sync mode: blocking call returning with EAGAIN indicates timeout.
-          signalException(GLOO_ERROR_MSG("Write timeout ", peer_.str()));
-        } else {
-          // Async mode: can't write more than this.
-        }
+      int err = SSL_get_error(ssl_, rv);
+      const char* err_str = nullptr;
+      switch (err) {
+        case SSL_ERROR_NONE: err_str = "SSL_ERROR_NONE"; break;
+        case SSL_ERROR_SSL: err_str = "SSL_ERROR_SSL"; break;
+        case SSL_ERROR_WANT_READ: err_str = "SSL_ERROR_WANT_READ"; break;
+        case SSL_ERROR_WANT_WRITE: err_str = "SSL_ERROR_WANT_WRITE"; break;
+        case SSL_ERROR_WANT_X509_LOOKUP: err_str = "SSL_ERROR_WANT_X509_LOOKUP"; break;
+        case SSL_ERROR_SYSCALL: err_str = "SSL_ERROR_SYSCALL"; break;
+        case SSL_ERROR_ZERO_RETURN: err_str = "SSL_ERROR_ZERO_RETURN"; break;
+        case SSL_ERROR_WANT_CONNECT: err_str = "SSL_ERROR_WANT_CONNECT"; break;
+        case SSL_ERROR_WANT_ACCEPT: err_str = "SSL_ERROR_WANT_ACCEPT"; break;
+        case SSL_ERROR_WANT_ASYNC: err_str = "SSL_ERROR_WANT_ASYNC"; break;
+        case SSL_ERROR_WANT_ASYNC_JOB: err_str = "SSL_ERROR_WANT_ASYNC_JOB"; break;
+        case SSL_ERROR_WANT_CLIENT_HELLO_CB: err_str = "SSL_ERROR_WANT_CLIENT_HELLO_CB"; break;
+        default: err_str = ""; break;
+      }
+
+      std::cout << "[" << getpid() << "]" << " write " << ioc << " bytes" << std::endl;
+      std::cout << "[" << getpid() << "]" << " write err = " << err_str << "(" << err << ")" << std::endl;
+      std::cout << "[" << getpid() << "]" << " write errno = " << strerror(errno) << "(" << errno << ")" << std::endl;
+      ERR_print_errors_fp(stderr);
+
+      assert(err != SSL_ERROR_NONE);
+      assert(err != SSL_ERROR_WANT_READ);
+
+      if (err == SSL_ERROR_WANT_WRITE) {
         return false;
       }
 
-      // Retry on EINTR
-      if (errno == EINTR) {
-        continue;
+      if (err == SSL_ERROR_SYSCALL) {
+        if (errno == EPIPE) {
+          if (!sync_) {
+            return false;
+          }
+        }
       }
 
       // Unexpected error
       signalException(
-          GLOO_ERROR_MSG("writev ", peer_.str(), ": ", strerror(errno)));
+          GLOO_ERROR_MSG("Write error ", peer_.str(), "(sync=", sync_, ")", ": ", err_str, ", errno = ", strerror(errno)));
       return false;
     }
     std::cout << "[" << getpid() << "]" << " write success " << rv << " bytes" << std::endl;
@@ -604,41 +627,63 @@ bool Pair::read() {
     for (;;) {
       // Alas, readv does not support flags, so we need to use recv
       std::cout << "[" << getpid() << "]" << " read try " << iov.iov_len << " bytes" << std::endl;
-      rv = ::recv(fd_, iov.iov_base, iov.iov_len, busyPoll_ ? MSG_DONTWAIT : 0);
-      if (rv == -1) {
+      rv = SSL_read(ssl_, iov.iov_base, iov.iov_len);
+      if (rv <= 0) {
         std::cout << "[" << getpid() << "]" << " read error " << errno << std::endl;
-        // EAGAIN happens when (1) non-blocking and there are no more bytes left
-        // to read or (2) blocking and timeout occurs.
-        if (errno == EAGAIN) {
-          if (sync_) {
-            // Sync mode: EAGAIN indicates nothing to read right now.
-            auto hasTimedOut = [&] {
-              return (timeout_ != kNoTimeout) &&
-                  ((std::chrono::steady_clock::now() - start) >= timeout_);
-            };
-            if (busyPoll_ && !hasTimedOut()) {
-              // Keep looping on EAGAIN if busy-poll flag has been set and the
-              // timeout (if set) hasn't been reached
-              continue;
-            } else {
-              // Either timeout on poll or blocking call returning with EAGAIN
-              // indicates timeout
-              signalException(GLOO_ERROR_MSG("Read timeout ", peer_.str()));
-            }
-          } else {
-            // Async mode: can't read more than this.
-          }
+        int err = SSL_get_error(ssl_, rv);
+        const char* err_str = nullptr;
+        switch (err) {
+          case SSL_ERROR_NONE: err_str = "SSL_ERROR_NONE"; break;
+          case SSL_ERROR_SSL: err_str = "SSL_ERROR_SSL"; break;
+          case SSL_ERROR_WANT_READ: err_str = "SSL_ERROR_WANT_READ"; break;
+          case SSL_ERROR_WANT_WRITE: err_str = "SSL_ERROR_WANT_WRITE"; break;
+          case SSL_ERROR_WANT_X509_LOOKUP: err_str = "SSL_ERROR_WANT_X509_LOOKUP"; break;
+          case SSL_ERROR_SYSCALL: err_str = "SSL_ERROR_SYSCALL"; break;
+          case SSL_ERROR_ZERO_RETURN: err_str = "SSL_ERROR_ZERO_RETURN"; break;
+          case SSL_ERROR_WANT_CONNECT: err_str = "SSL_ERROR_WANT_CONNECT"; break;
+          case SSL_ERROR_WANT_ACCEPT: err_str = "SSL_ERROR_WANT_ACCEPT"; break;
+          case SSL_ERROR_WANT_ASYNC: err_str = "SSL_ERROR_WANT_ASYNC"; break;
+          case SSL_ERROR_WANT_ASYNC_JOB: err_str = "SSL_ERROR_WANT_ASYNC_JOB"; break;
+          case SSL_ERROR_WANT_CLIENT_HELLO_CB: err_str = "SSL_ERROR_WANT_CLIENT_HELLO_CB"; break;
+          default: err_str = "";
+        }
+
+        std::cout << "[" << getpid() << "]" << " read " << iov.iov_len << " bytes" << std::endl;
+        std::cout << "[" << getpid() << "]" << " read err = " << err_str << "(" << err << ")" << std::endl;
+        std::cout << "[" << getpid() << "]" << " read errno = " << strerror(errno) << "(" << errno << ")" << std::endl;
+        ERR_print_errors_fp(stderr);
+
+        assert(err != SSL_ERROR_NONE);
+        assert(err != SSL_ERROR_WANT_WRITE);
+
+        if (err == SSL_ERROR_WANT_READ) {
           return false;
         }
 
-        // Retry on EINTR
-        if (errno == EINTR) {
-          continue;
+        if (err == SSL_ERROR_ZERO_RETURN) {
+          if (errno == 0) {
+            if (!sync_) {
+              return false;
+            }
+          }
+          if (errno == ECONNRESET) {
+            if (!sync_) {
+              return false;
+            }
+          }
+        }
+
+        if (err == SSL_ERROR_SYSCALL) {
+          if (errno == 0) {
+            if (!sync_) {
+              return false;
+            }
+          }
         }
 
         // Unexpected error
         signalException(
-            GLOO_ERROR_MSG("Read error ", peer_.str(), ": ", strerror(errno)));
+            GLOO_ERROR_MSG("Read error ", peer_.str(), "(sync=", sync_, ")", ": ", err_str, ", errno = ", strerror(errno)));
         return false;
       }
       std::cout << "[" << getpid() << "]" << " read success " << rv << " bytes" << std::endl;
@@ -967,6 +1012,8 @@ void Pair::changeState(state nextState) noexcept {
         fd_ = FD_INVALID;
         break;
       case SSL_CONNECTED:
+        SSL_shutdown(ssl_);
+        SSL_free(ssl_);
         if (!sync_) {
           device_->unregisterDescriptor(fd_);
         }
