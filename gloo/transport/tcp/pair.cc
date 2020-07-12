@@ -410,7 +410,6 @@ bool Pair::write(Op& op) {
   NonOwningPtr<UnboundBuffer> buf;
   std::array<struct iovec, 2> iov;
   int ioc;
-  ssize_t rv;
 
   const auto opcode = op.getOpcode();
 
@@ -422,79 +421,75 @@ bool Pair::write(Op& op) {
     }
   }
 
-  for (;;) {
-    const auto nbytes = prepareWrite(op, buf, iov.data(), ioc);
-
-    // Write
-    std::cout << "[" << getpid() << "]" << " write try " << ioc << " bytes" << std::endl;
-    rv = SSL_write(ssl_, iov.data(), ioc);
-    if (rv <= 0) {
-      std::cout << "[" << getpid() << "]" << " write error " << errno << std::endl;
-      int err = SSL_get_error(ssl_, rv);
-      const char* err_str = nullptr;
-      switch (err) {
-        case SSL_ERROR_NONE: err_str = "SSL_ERROR_NONE"; break;
-        case SSL_ERROR_SSL: err_str = "SSL_ERROR_SSL"; break;
-        case SSL_ERROR_WANT_READ: err_str = "SSL_ERROR_WANT_READ"; break;
-        case SSL_ERROR_WANT_WRITE: err_str = "SSL_ERROR_WANT_WRITE"; break;
-        case SSL_ERROR_WANT_X509_LOOKUP: err_str = "SSL_ERROR_WANT_X509_LOOKUP"; break;
-        case SSL_ERROR_SYSCALL: err_str = "SSL_ERROR_SYSCALL"; break;
-        case SSL_ERROR_ZERO_RETURN: err_str = "SSL_ERROR_ZERO_RETURN"; break;
-        case SSL_ERROR_WANT_CONNECT: err_str = "SSL_ERROR_WANT_CONNECT"; break;
-        case SSL_ERROR_WANT_ACCEPT: err_str = "SSL_ERROR_WANT_ACCEPT"; break;
-        case SSL_ERROR_WANT_ASYNC: err_str = "SSL_ERROR_WANT_ASYNC"; break;
-        case SSL_ERROR_WANT_ASYNC_JOB: err_str = "SSL_ERROR_WANT_ASYNC_JOB"; break;
-        case SSL_ERROR_WANT_CLIENT_HELLO_CB: err_str = "SSL_ERROR_WANT_CLIENT_HELLO_CB"; break;
-        default: err_str = ""; break;
+  const auto nbytes = prepareWrite(op, buf, iov.data(), ioc);
+  ssize_t total_rv = 0;
+  for (int i = 0; i < ioc; ++i) {
+    for (;;) {
+      if (iov[i].iov_len == 0) {
+        break;
       }
+//      assert(iov[i].iov_len != 0);
+      std::cout << "[" << getpid() << "]" << " write try " << iov[i].iov_len << " bytes" << std::endl;
+      ssize_t rv = SSL_write(ssl_, iov[i].iov_base, iov[i].iov_len);
+      if (rv <= 0) {
+        int err = SSL_get_error(ssl_, rv);
+        const char* err_str = nullptr;
+        switch (err) {
+          case SSL_ERROR_NONE: err_str = "SSL_ERROR_NONE"; break;
+          case SSL_ERROR_SSL: err_str = "SSL_ERROR_SSL"; break;
+          case SSL_ERROR_WANT_READ: err_str = "SSL_ERROR_WANT_READ"; break;
+          case SSL_ERROR_WANT_WRITE: err_str = "SSL_ERROR_WANT_WRITE"; break;
+          case SSL_ERROR_WANT_X509_LOOKUP: err_str = "SSL_ERROR_WANT_X509_LOOKUP"; break;
+          case SSL_ERROR_SYSCALL: err_str = "SSL_ERROR_SYSCALL"; break;
+          case SSL_ERROR_ZERO_RETURN: err_str = "SSL_ERROR_ZERO_RETURN"; break;
+          case SSL_ERROR_WANT_CONNECT: err_str = "SSL_ERROR_WANT_CONNECT"; break;
+          case SSL_ERROR_WANT_ACCEPT: err_str = "SSL_ERROR_WANT_ACCEPT"; break;
+          case SSL_ERROR_WANT_ASYNC: err_str = "SSL_ERROR_WANT_ASYNC"; break;
+          case SSL_ERROR_WANT_ASYNC_JOB: err_str = "SSL_ERROR_WANT_ASYNC_JOB"; break;
+          case SSL_ERROR_WANT_CLIENT_HELLO_CB: err_str = "SSL_ERROR_WANT_CLIENT_HELLO_CB"; break;
+          default: err_str = ""; break;
+        }
+        std::cout << "[" << getpid() << "]" << " write err = " << err_str << "(" << err << ")" << "(sync=" << sync_ << ")" << std::endl;
+        std::cout << "[" << getpid() << "]" << " write errno = " << strerror(errno) << "(" << errno << ")" << "(sync=" << sync_ << ")" << std::endl;
+        ERR_print_errors_fp(stderr);
 
-      std::cout << "[" << getpid() << "]" << " write " << ioc << " bytes" << std::endl;
-      std::cout << "[" << getpid() << "]" << " write err = " << err_str << "(" << err << ")" << std::endl;
-      std::cout << "[" << getpid() << "]" << " write errno = " << strerror(errno) << "(" << errno << ")" << std::endl;
-      ERR_print_errors_fp(stderr);
+        assert(err != SSL_ERROR_NONE);
+        assert(err != SSL_ERROR_WANT_READ);
 
-      assert(err != SSL_ERROR_NONE);
-      assert(err != SSL_ERROR_WANT_READ);
+        if (err == SSL_ERROR_WANT_WRITE) {
+          continue; // this is a quick fix, maybe remembering the state and retrying is more efficient
+//          return false;
+        }
 
-      if (err == SSL_ERROR_WANT_WRITE) {
-        return false;
-      }
-
-      if (err == SSL_ERROR_SYSCALL) {
-        if (errno == EPIPE) {
-          if (!sync_) {
-            return false;
+        if (err == SSL_ERROR_SYSCALL) {
+//          if (errno == 0) {
+//            if (!sync_) {
+//              return false;
+//            }
+//          }
+          if (errno == EPIPE) {
+            if (!sync_) {
+              return false;
+            }
           }
         }
+
+        // Unexpected error
+        signalException(GLOO_ERROR_MSG("Write error ", peer_.str(), "(sync=", sync_, ")", ": ", err_str, ", errno = ", strerror(errno)));
+        return false;
       }
-
-      // Unexpected error
-      signalException(
-          GLOO_ERROR_MSG("Write error ", peer_.str(), "(sync=", sync_, ")", ": ", err_str, ", errno = ", strerror(errno)));
-      return false;
-    }
-    std::cout << "[" << getpid() << "]" << " write success " << rv << " bytes" << std::endl;
-
-    // From write(2) man page (NOTES section):
-    //
-    //  If a write() is interrupted by a signal handler before any
-    //  bytes are written, then the call fails with the error EINTR;
-    //  if it is interrupted after at least one byte has been written,
-    //  the call succeeds, and returns the number of bytes written.
-    //
-    // If rv < nbytes we ALWAYS retry, regardless of sync/async mode,
-    // since an EINTR may or may not have happened. If this was not
-    // the case, and the kernel buffer is full, the next call to
-    // write(2) will return EAGAIN, which is handled appropriately.
-    op.nwritten += rv;
-    if (rv < nbytes) {
-      continue;
+      std::cout << "[" << getpid() << "]" << " write success " << rv << " bytes" << std::endl;
+      total_rv += rv;
+      op.nwritten += rv;
+//      if (rv < iov[i].iov_len) {
+//        continue;
+//      }
+      break;
     }
 
-    GLOO_ENFORCE_EQ(rv, nbytes);
-    GLOO_ENFORCE_EQ(op.nwritten, op.preamble.nbytes);
-    break;
   }
+  GLOO_ENFORCE_EQ(total_rv, nbytes);
+  GLOO_ENFORCE_EQ(op.nwritten, op.preamble.nbytes);
 
   // Write completed
   switch (opcode) {
@@ -648,9 +643,8 @@ bool Pair::read() {
           default: err_str = "";
         }
 
-        std::cout << "[" << getpid() << "]" << " read " << iov.iov_len << " bytes" << std::endl;
-        std::cout << "[" << getpid() << "]" << " read err = " << err_str << "(" << err << ")" << std::endl;
-        std::cout << "[" << getpid() << "]" << " read errno = " << strerror(errno) << "(" << errno << ")" << std::endl;
+        std::cout << "[" << getpid() << "]" << " read err = " << err_str << "(" << err << ")" << "(sync=" << sync_ << ")" << std::endl;
+        std::cout << "[" << getpid() << "]" << " read errno = " << strerror(errno) << "(" << errno << ")" << "(sync=" << sync_ << ")" << std::endl;
         ERR_print_errors_fp(stderr);
 
         assert(err != SSL_ERROR_NONE);
@@ -661,11 +655,11 @@ bool Pair::read() {
         }
 
         if (err == SSL_ERROR_ZERO_RETURN) {
-          if (errno == 0) {
-            if (!sync_) {
-              return false;
-            }
-          }
+//          if (errno == 0) {
+//            if (!sync_) {
+//              return false;
+//            }
+//          }
           if (errno == ECONNRESET) {
             if (!sync_) {
               return false;
@@ -674,9 +668,19 @@ bool Pair::read() {
         }
 
         if (err == SSL_ERROR_SYSCALL) {
-          if (errno == 0) {
+//          if (errno == 0) {
+//            if (!sync_) {
+//              return false;
+//            }
+//          }
+          if (errno == EPIPE) {
             if (!sync_) {
               return false;
+            }
+          }
+          if (errno == ECONNRESET) {
+            if (!sync_) {
+              return false; // Exit if Connection reset by peer on read
             }
           }
         }
