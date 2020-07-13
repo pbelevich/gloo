@@ -68,21 +68,17 @@ Pair::Pair(
       is_client_(false),
       sendBufferSize_(0),
       ex_(nullptr) {
-  std::cout << "[" << getpid() << "]" << " c-tor started" << std::endl;
   listen();
-  std::cout << "[" << getpid() << "]" << " c-tor finished" << std::endl;
 }
 
 // Destructor performs a "soft" close.
 Pair::~Pair() {
-  std::cout << "[" << getpid() << "]" << " d-tor started" << std::endl;
   // Needs lock so that this doesn't race with read/write of the
   // underlying file descriptor on the device thread.
   std::lock_guard<std::mutex> lock(m_);
   if (state_ != CLOSED) {
     changeState(CLOSED);
   }
-  std::cout << "[" << getpid() << "]" << " d-tor finished" << std::endl;
 }
 
 // The close function performs a "hard" close.
@@ -92,7 +88,6 @@ void Pair::close() {
   // Needs lock so that this doesn't race with read/write of the
   // underlying file descriptor on the device thread.
   std::lock_guard<std::mutex> lock(m_);
-  std::cout << "[" << getpid() << "]" << " close started" << std::endl;
   if (state_ != CLOSED) {
     if (fd_ != FD_INVALID) {
       struct linger sl;
@@ -102,7 +97,6 @@ void Pair::close() {
     }
     changeState(CLOSED);
   }
-  std::cout << "[" << getpid() << "]" << " close finished" << std::endl;
 }
 
 const Address& Pair::address() const {
@@ -124,7 +118,6 @@ static void setSocketBlocking(int fd, bool enable) {
   }
   rv = fcntl(fd, F_SETFL, rv);
   GLOO_ENFORCE_NE(rv, -1);
-  std::cout << "[" << getpid() << "]" << " setSocketBlocking(" << enable << ")" << std::endl;
 }
 
 void Pair::setSync(bool sync, bool busyPoll) {
@@ -175,10 +168,8 @@ int Pair::handshake() {
     GLOO_ENFORCE(r, "SSL_set_fd failed");
     if (is_client_) {
       SSL_set_connect_state(ssl_);
-      std::cout << "[" << getpid() << "]" << " handshake SSL_set_connect_state" << std::endl;
     } else {
       SSL_set_accept_state(ssl_);
-      std::cout << "[" << getpid() << "]" << " handshake SSL_set_accept_state" << std::endl;
     }
   }
 
@@ -202,7 +193,6 @@ int Pair::handshake() {
 
 void Pair::listen() {
   std::lock_guard<std::mutex> lock(m_);
-  std::cout << "[" << getpid() << "]" << " listen start" << std::endl;
   int rv;
 
   const auto& attr = device_->attr_;
@@ -240,13 +230,11 @@ void Pair::listen() {
   // Register with device so we're called when peer connects
   changeState(LISTENING);
   device_->registerDescriptor(fd_, EPOLLIN, this);
-  std::cout << "[" << getpid() << "]" << " listen finished" << std::endl;
   return;
 }
 
 void Pair::connect(const Address& peer) {
   std::unique_lock<std::mutex> lock(m_);
-  std::cout << "[" << getpid() << "]" << " connect start" << std::endl;
   int rv;
   socklen_t addrlen;
   throwIfException();
@@ -290,7 +278,6 @@ void Pair::connect(const Address& peer) {
   // self_ < peer_; we are listening side.
   if (!is_client_) {
     waitUntil(SSL_CONNECTED, lock, true);
-    std::cout << "[" << getpid() << "]" << " connect finished (listening and now connected)" << std::endl;
     return;
   }
 
@@ -343,7 +330,6 @@ void Pair::connect(const Address& peer) {
   assert(state_ == SSL_CONNECTED);
 
   waitUntil(SSL_CONNECTED, lock, true);
-  std::cout << "[" << getpid() << "]" << " connect finished (connecting and now connected)" << std::endl;
 }
 
 ssize_t Pair::prepareWrite(
@@ -428,45 +414,18 @@ bool Pair::write(Op& op) {
       if (iov[i].iov_len == 0) {
         break;
       }
-//      assert(iov[i].iov_len != 0);
-      std::cout << "[" << getpid() << "]" << " write try " << iov[i].iov_len << " bytes" << std::endl;
       ssize_t rv = SSL_write(ssl_, iov[i].iov_base, iov[i].iov_len);
       if (rv <= 0) {
         int err = SSL_get_error(ssl_, rv);
-        const char* err_str = nullptr;
-        switch (err) {
-          case SSL_ERROR_NONE: err_str = "SSL_ERROR_NONE"; break;
-          case SSL_ERROR_SSL: err_str = "SSL_ERROR_SSL"; break;
-          case SSL_ERROR_WANT_READ: err_str = "SSL_ERROR_WANT_READ"; break;
-          case SSL_ERROR_WANT_WRITE: err_str = "SSL_ERROR_WANT_WRITE"; break;
-          case SSL_ERROR_WANT_X509_LOOKUP: err_str = "SSL_ERROR_WANT_X509_LOOKUP"; break;
-          case SSL_ERROR_SYSCALL: err_str = "SSL_ERROR_SYSCALL"; break;
-          case SSL_ERROR_ZERO_RETURN: err_str = "SSL_ERROR_ZERO_RETURN"; break;
-          case SSL_ERROR_WANT_CONNECT: err_str = "SSL_ERROR_WANT_CONNECT"; break;
-          case SSL_ERROR_WANT_ACCEPT: err_str = "SSL_ERROR_WANT_ACCEPT"; break;
-          case SSL_ERROR_WANT_ASYNC: err_str = "SSL_ERROR_WANT_ASYNC"; break;
-          case SSL_ERROR_WANT_ASYNC_JOB: err_str = "SSL_ERROR_WANT_ASYNC_JOB"; break;
-          case SSL_ERROR_WANT_CLIENT_HELLO_CB: err_str = "SSL_ERROR_WANT_CLIENT_HELLO_CB"; break;
-          default: err_str = ""; break;
-        }
-        std::cout << "[" << getpid() << "]" << " write err = " << err_str << "(" << err << ")" << "(sync=" << sync_ << ")" << std::endl;
-        std::cout << "[" << getpid() << "]" << " write errno = " << strerror(errno) << "(" << errno << ")" << "(sync=" << sync_ << ")" << std::endl;
-        ERR_print_errors_fp(stderr);
 
         assert(err != SSL_ERROR_NONE);
         assert(err != SSL_ERROR_WANT_READ);
 
         if (err == SSL_ERROR_WANT_WRITE) {
           continue; // this is a quick fix, maybe remembering the state and retrying is more efficient
-//          return false;
         }
 
         if (err == SSL_ERROR_SYSCALL) {
-//          if (errno == 0) {
-//            if (!sync_) {
-//              return false;
-//            }
-//          }
           if (errno == EPIPE) {
             if (!sync_) {
               return false;
@@ -475,15 +434,11 @@ bool Pair::write(Op& op) {
         }
 
         // Unexpected error
-        signalException(GLOO_ERROR_MSG("Write error ", peer_.str(), "(sync=", sync_, ")", ": ", err_str, ", errno = ", strerror(errno)));
+        signalException(GLOO_ERROR_MSG("Write error ", peer_.str(), "(sync=", sync_, ")", ": ", err, ", errno = ", strerror(errno)));
         return false;
       }
-      std::cout << "[" << getpid() << "]" << " write success " << rv << " bytes" << std::endl;
       total_rv += rv;
       op.nwritten += rv;
-//      if (rv < iov[i].iov_len) {
-//        continue;
-//      }
       break;
     }
 
@@ -621,31 +576,9 @@ bool Pair::read() {
     ssize_t rv = 0;
     for (;;) {
       // Alas, readv does not support flags, so we need to use recv
-      std::cout << "[" << getpid() << "]" << " read try " << iov.iov_len << " bytes" << std::endl;
       rv = SSL_read(ssl_, iov.iov_base, iov.iov_len);
       if (rv <= 0) {
-        std::cout << "[" << getpid() << "]" << " read error " << errno << std::endl;
         int err = SSL_get_error(ssl_, rv);
-        const char* err_str = nullptr;
-        switch (err) {
-          case SSL_ERROR_NONE: err_str = "SSL_ERROR_NONE"; break;
-          case SSL_ERROR_SSL: err_str = "SSL_ERROR_SSL"; break;
-          case SSL_ERROR_WANT_READ: err_str = "SSL_ERROR_WANT_READ"; break;
-          case SSL_ERROR_WANT_WRITE: err_str = "SSL_ERROR_WANT_WRITE"; break;
-          case SSL_ERROR_WANT_X509_LOOKUP: err_str = "SSL_ERROR_WANT_X509_LOOKUP"; break;
-          case SSL_ERROR_SYSCALL: err_str = "SSL_ERROR_SYSCALL"; break;
-          case SSL_ERROR_ZERO_RETURN: err_str = "SSL_ERROR_ZERO_RETURN"; break;
-          case SSL_ERROR_WANT_CONNECT: err_str = "SSL_ERROR_WANT_CONNECT"; break;
-          case SSL_ERROR_WANT_ACCEPT: err_str = "SSL_ERROR_WANT_ACCEPT"; break;
-          case SSL_ERROR_WANT_ASYNC: err_str = "SSL_ERROR_WANT_ASYNC"; break;
-          case SSL_ERROR_WANT_ASYNC_JOB: err_str = "SSL_ERROR_WANT_ASYNC_JOB"; break;
-          case SSL_ERROR_WANT_CLIENT_HELLO_CB: err_str = "SSL_ERROR_WANT_CLIENT_HELLO_CB"; break;
-          default: err_str = "";
-        }
-
-        std::cout << "[" << getpid() << "]" << " read err = " << err_str << "(" << err << ")" << "(sync=" << sync_ << ")" << std::endl;
-        std::cout << "[" << getpid() << "]" << " read errno = " << strerror(errno) << "(" << errno << ")" << "(sync=" << sync_ << ")" << std::endl;
-        ERR_print_errors_fp(stderr);
 
         assert(err != SSL_ERROR_NONE);
         assert(err != SSL_ERROR_WANT_WRITE);
@@ -655,11 +588,6 @@ bool Pair::read() {
         }
 
         if (err == SSL_ERROR_ZERO_RETURN) {
-//          if (errno == 0) {
-//            if (!sync_) {
-//              return false;
-//            }
-//          }
           if (errno == ECONNRESET) {
             if (!sync_) {
               return false;
@@ -668,11 +596,6 @@ bool Pair::read() {
         }
 
         if (err == SSL_ERROR_SYSCALL) {
-//          if (errno == 0) {
-//            if (!sync_) {
-//              return false;
-//            }
-//          }
           if (errno == EPIPE) {
             if (!sync_) {
               return false;
@@ -680,17 +603,16 @@ bool Pair::read() {
           }
           if (errno == ECONNRESET) {
             if (!sync_) {
-              return false; // Exit if Connection reset by peer on read
+              return false;
             }
           }
         }
 
         // Unexpected error
         signalException(
-            GLOO_ERROR_MSG("Read error ", peer_.str(), "(sync=", sync_, ")", ": ", err_str, ", errno = ", strerror(errno)));
+            GLOO_ERROR_MSG("Read error ", peer_.str(), "(sync=", sync_, ")", ": ", err, ", errno = ", strerror(errno)));
         return false;
       }
-      std::cout << "[" << getpid() << "]" << " read success " << rv << " bytes" << std::endl;
       break;
     }
 
@@ -805,10 +727,8 @@ void Pair::handleEvents(int events) {
   // be acquired.
   std::unique_lock<std::mutex> lock(m_, std::try_to_lock);
   if (!lock) {
-//    std::cout << "[" << getpid() << "]" << " handleEvents !lock" << std::endl;
     return;
   }
-//  std::cout << "[" << getpid() << "]" << " handleEvents start " << events << std::endl;
 
   // State must be <= SSL_CONNECTED.
   // If state is CLOSED; this function will NOT be called. Refer to
@@ -869,7 +789,6 @@ void Pair::handleEvents(int events) {
 }
 
 void Pair::handleListening() {
-  std::cout << "[" << getpid() << "]" << " handleListening started" << std::endl;
   struct sockaddr_storage addr;
   socklen_t addrlen = sizeof(addr);
   int rv;
@@ -892,11 +811,9 @@ void Pair::handleListening() {
 
   // Common connection-made code
   handleConnected();
-  std::cout << "[" << getpid() << "]" << " handleListening finished" << std::endl;
 }
 
 void Pair::handleConnecting() {
-  std::cout << "[" << getpid() << "]" << " handleConnecting started" << std::endl;
   int optval;
   socklen_t optlen = sizeof(optval);
   int rv;
@@ -912,11 +829,9 @@ void Pair::handleConnecting() {
 
   // Common connection-made code
   handleConnected();
-  std::cout << "[" << getpid() << "]" << " handleConnecting finished" << std::endl;
 }
 
 void Pair::handleConnected() {
-  std::cout << "[" << getpid() << "]" << " handleConnected started" << std::endl;
   int rv;
 
   // Reset addresses
@@ -942,7 +857,6 @@ void Pair::handleConnected() {
 
   device_->registerDescriptor(fd_, EPOLLIN, this);
   changeState(CONNECTED);
-  std::cout << "[" << getpid() << "]" << " handleConnected finished" << std::endl;
 }
 
 // getBuffer must only be called when holding lock.
@@ -1031,8 +945,6 @@ void Pair::changeState(state nextState) noexcept {
     }
   }
 
-  std::cout << "[" << getpid() << "]" << " changed state from "
-            << state_ << " to " << nextState << std::endl;
   state_ = nextState;
   cv_.notify_all();
 }
@@ -1315,7 +1227,6 @@ std::exception_ptr Pair::signalExceptionExternal(const std::string& msg) {
 }
 
 void Pair::signalException(const std::string& msg) {
-  std::cout << "[" << getpid() << "]" << " signalException: " << msg << std::endl;
   signalException(std::make_exception_ptr(::gloo::IoException(msg)));
 }
 
@@ -1366,7 +1277,6 @@ void Pair::signalException(std::exception_ptr ex) {
 }
 
 void Pair::signalAndThrowException(const std::string& msg) {
-  std::cout << "[" << getpid() << "]" << " signalAndThrowException: " << msg << std::endl;
   signalAndThrowException(std::make_exception_ptr(::gloo::IoException(msg)));
 }
 
